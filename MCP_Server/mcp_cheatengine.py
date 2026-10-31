@@ -93,6 +93,8 @@ import time
 import math
 import threading
 import traceback
+import uuid
+import weakref
 
 try:
     from mcp.server.fastmcp import FastMCP
@@ -222,6 +224,52 @@ def _parse_tcp_port(raw_value):
 CE_MCP_TRANSPORT = _parse_transport(os.environ.get("CE_MCP_TRANSPORT"))
 CE_MCP_HOST = os.environ.get("CE_MCP_HOST", DEFAULT_TCP_HOST).strip() or DEFAULT_TCP_HOST
 CE_MCP_PORT = _parse_tcp_port(os.environ.get("CE_MCP_PORT"))
+CE_MCP_CLIENT_NAME = os.environ.get("CE_MCP_CLIENT_NAME", "").strip()
+
+# ============================================================================
+# SESSION IDENTITY
+# The Lua bridge lets one client own the session at a time (SESSION_IN_USE for
+# others). Each MCP session gets its own stable client_id so ownership survives
+# pipe reconnects, and so HTTP mode can tell concurrent MCP sessions apart.
+# ============================================================================
+
+_PROCESS_CLIENT_ID = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
+_mcp_session_ids = weakref.WeakKeyDictionary()  # ServerSession -> per-process index
+_mcp_session_lock = threading.Lock()
+
+
+def _current_mcp_session():
+    """Return the ServerSession for the in-flight tool call, or None."""
+    try:
+        return mcp.get_context().session
+    except Exception:
+        return None
+
+
+def _session_identity():
+    """Describe the calling MCP session to the Lua bridge."""
+    session = _current_mcp_session()
+    client_id = _PROCESS_CLIENT_ID
+    name = CE_MCP_CLIENT_NAME
+    if session is not None:
+        with _mcp_session_lock:
+            index = _mcp_session_ids.get(session)
+            if index is None:
+                index = len(_mcp_session_ids) + 1
+                _mcp_session_ids[session] = index
+        client_id = f"{_PROCESS_CLIENT_ID}:s{index}"
+        if not name:
+            try:
+                info = session.client_params.clientInfo
+                name = f"{info.name} {info.version}".strip()
+            except Exception:
+                pass
+    return {
+        "client_id": client_id,
+        "name": name or "mcp_cheatengine",
+        "host": socket.gethostname(),
+        "pid": os.getpid(),
+    }
 
 # ============================================================================
 # BRIDGE CLIENTS
@@ -303,7 +351,8 @@ class CEBridgeClient:
                 "jsonrpc": "2.0",
                 "method": method,
                 "params": params or {},
-                "id": int(time.time() * 1000)
+                "id": int(time.time() * 1000),
+                "session": _session_identity(),
             }
             
             try:
@@ -1128,6 +1177,54 @@ def generate_code_injection_script(address: str) -> str:
 def ping() -> str:
     """Check connectivity and get version info."""
     return format_result(ce_client.send_command("ping"))
+
+# --- SESSION OWNERSHIP (Unit 25) ---
+
+@mcp.tool()
+def get_session_status() -> str:
+    """Show which client owns the Cheat Engine bridge session and who else is trying to use it.
+
+    Only one client owns the session at a time; other clients' commands fail with
+    error_code SESSION_IN_USE. Use this to see the owner (name, host, pid, idle time)
+    and any rejected 'contenders' from the last 10 minutes.
+
+    Returns:
+        JSON with {success, you, you_are_owner, owner, open_connections,
+        idle_timeout_seconds, contenders: [{client_id, name, host, pid, attempts,
+        last_method, seconds_since_last_attempt}]}.
+    """
+    return format_result(ce_client.send_command("get_session_status"))
+
+@mcp.tool()
+def take_over_session(force: bool = False, cleanup: bool = False) -> str:
+    """Claim the Cheat Engine bridge session, optionally disconnecting the current owner.
+
+    IMPORTANT: Only pass force=True after the user has explicitly approved taking the
+    session away from the other client (check get_session_status first and tell the
+    user who holds it). The evicted client gets SESSION_TAKEN_OVER on its next call.
+
+    Without force, this only succeeds if the session is free, already yours, or the
+    owner has been idle past the timeout (1 hour).
+
+    Args:
+        force: Take the session even if another client owns it.
+        cleanup: Also remove all breakpoints, DBVM watches and scans left by the
+            previous owner (same cleanup as reloading the bridge script).
+
+    Returns:
+        JSON with {success, owner, previous_owner, cleaned_up}, or
+        {success=false, error_code="SESSION_IN_USE", owner} when force is needed.
+    """
+    return format_result(ce_client.send_command("take_over_session", {"force": force, "cleanup": cleanup}))
+
+@mcp.tool()
+def release_session() -> str:
+    """Release ownership of the Cheat Engine bridge session so another client can use it.
+
+    Returns:
+        JSON with {success, released}.
+    """
+    return format_result(ce_client.send_command("release_session"))
 
 # --- DEBUG OUTPUT & MULTIMEDIA (Unit 23) ---
 

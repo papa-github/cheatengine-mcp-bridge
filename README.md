@@ -303,6 +303,10 @@ Check these in order:
 4. `pip install -r MCP_Server/requirements.txt` has installed both `mcp` and `pywin32`.
 5. Run the MCP `ping` tool. A successful connection returns `success: true` and the bridge version. `process_id: 0` is normal until Cheat Engine is attached to a target process.
 
+### `SESSION_IN_USE` / another agent holds the bridge
+
+Only one MCP client owns the bridge at a time; others get `SESSION_IN_USE` naming the owner. Run `get_session_status` to see the owner and anyone else trying to connect, then `take_over_session(force=true)` to disconnect the owner (agents are told to ask you first). The session is also released automatically when the owner disconnects or has been idle for an hour, so there's no need to kill stale `mcp_cheatengine.py` processes.
+
 ---
 
 ## Environment Variables
@@ -311,6 +315,7 @@ Check these in order:
 |----------|---------|---------|
 | `CE_MCP_TIMEOUT` | `30` | Timeout (seconds) for each MCP tool call. |
 | `CE_MCP_ALLOW_SHELL` | *unset* | Set to `1` to enable `run_command` / `shell_execute` tools. **Arbitrary code execution risk** — leave unset by default. |
+| `CE_MCP_CLIENT_NAME` | MCP client name | Name other clients see in `SESSION_IN_USE` / `get_session_status`. |
 
 ---
 

@@ -17,8 +17,16 @@ local serverState = {
     breakpoints = {},
     breakpoint_hits = {},
     hw_bp_slots = {},      -- Hardware breakpoint slots (max 4)
-    active_watches = {}    -- DBVM watch IDs for hypervisor-level tracing
+    active_watches = {},   -- DBVM watch IDs for hypervisor-level tracing
+    workers = {},          -- { slot, generation, thread, pipe } per pipe instance
+    connections = 0,       -- currently connected pipe clients
+    generation = 0,        -- bumped on each StartMCPBridge so connection ids stay unique
+    session = { owner = nil, contenders = {}, evicted = {} },  -- UNIT-25 ownership
 }
+
+-- A re-executed script gets a fresh serverState, so its own StopMCPBridge cannot
+-- see the previous load's worker threads. Stop them via the old global first.
+if type(StopMCPBridge) == "function" then pcall(StopMCPBridge) end
 
 -- ============================================================================
 -- UTILITY FUNCTIONS
@@ -5705,6 +5713,219 @@ end
 
 -- >>> END UNIT-24 <<<
 
+-- >>> BEGIN UNIT-25 Session Ownership <<<
+-- One client "owns" the bridge at a time. Several pipe instances are served so
+-- a second client gets a SESSION_IN_USE answer (and can inspect or take over the
+-- session) instead of a bare pipe-busy error. All functions here run on the
+-- main thread (executeCommand / thread.synchronize), so no locking is needed.
+
+local sessionManager = {
+    IDLE_TIMEOUT_SECONDS = 3600,   -- owner idle this long can be replaced without force
+    CONTENDER_TTL_SECONDS = 600,   -- how long a rejected client stays in get_session_status
+    MAX_CONTENDERS = 10,
+    MAX_PIPE_INSTANCES = 4,
+    -- Methods any client may call, owner or not
+    OPEN_METHODS = { ping = true, get_session_status = true, take_over_session = true, release_session = true },
+}
+
+function sessionManager.identify(request, connId)
+    -- Clients send { session = { client_id, name, host, pid } } alongside the
+    -- JSON-RPC fields. Legacy clients without it are identified by connection.
+    local info = type(request.session) == "table" and request.session or {}
+    local clientId = info.client_id
+    if type(clientId) ~= "string" or clientId == "" then
+        clientId = "conn-" .. tostring(connId)
+    end
+    return {
+        client_id = clientId,
+        name = type(info.name) == "string" and info.name or "unknown",
+        host = type(info.host) == "string" and info.host or nil,
+        pid = tonumber(info.pid),
+        conn_id = connId,
+    }
+end
+
+function sessionManager.describe(entry, now)
+    if not entry then return nil end
+    now = now or os.time()
+    return {
+        client_id = entry.client_id,
+        name = entry.name,
+        host = entry.host,
+        pid = entry.pid,
+        since = entry.since and os.date("%Y-%m-%d %H:%M:%S", entry.since) or nil,
+        last_activity = entry.last_activity and os.date("%Y-%m-%d %H:%M:%S", entry.last_activity) or nil,
+        idle_seconds = entry.last_activity and (now - entry.last_activity) or nil,
+    }
+end
+
+function sessionManager.claim(caller, now)
+    local s = serverState.session
+    s.owner = {
+        client_id = caller.client_id, name = caller.name, host = caller.host, pid = caller.pid,
+        conn_id = caller.conn_id, since = now, last_activity = now,
+    }
+    s.evicted[caller.client_id] = nil
+    s.contenders[caller.client_id] = nil
+    log(string.format("Session owned by %s (%s)", caller.name, caller.client_id))
+end
+
+function sessionManager.expireIdleOwner(now)
+    local s = serverState.session
+    if s.owner and (now - s.owner.last_activity) >= sessionManager.IDLE_TIMEOUT_SECONDS then
+        log(string.format("Session owner %s idle for %ds; releasing", s.owner.client_id, now - s.owner.last_activity))
+        s.owner = nil
+    end
+end
+
+function sessionManager.noteContender(caller, method, now)
+    local contenders = serverState.session.contenders
+    local entry = contenders[caller.client_id]
+    if not entry then
+        entry = { client_id = caller.client_id, first_seen = now, attempts = 0 }
+        contenders[caller.client_id] = entry
+    end
+    entry.name, entry.host, entry.pid = caller.name, caller.host, caller.pid
+    entry.last_seen = now
+    entry.last_method = method
+    entry.attempts = entry.attempts + 1
+
+    -- Drop expired entries, then the oldest if still over the cap
+    local count, oldestId, oldestSeen = 0, nil, nil
+    for id, c in pairs(contenders) do
+        if now - c.last_seen > sessionManager.CONTENDER_TTL_SECONDS then
+            contenders[id] = nil
+        else
+            count = count + 1
+            if not oldestSeen or c.last_seen < oldestSeen then oldestId, oldestSeen = id, c.last_seen end
+        end
+    end
+    if count > sessionManager.MAX_CONTENDERS and oldestId then contenders[oldestId] = nil end
+end
+
+function sessionManager.authorize(method, caller)
+    -- Returns nil if the caller may run `method`, else an error result table.
+    local s = serverState.session
+    local now = os.time()
+    if s.owner and s.owner.client_id == caller.client_id then
+        s.owner.last_activity = now
+        s.owner.conn_id = caller.conn_id
+        return nil
+    end
+    if sessionManager.OPEN_METHODS[method] then return nil end
+
+    sessionManager.expireIdleOwner(now)
+    if not s.owner then
+        sessionManager.claim(caller, now)
+        return nil
+    end
+
+    sessionManager.noteContender(caller, method, now)
+    local evicted = s.evicted[caller.client_id]
+    if evicted then
+        return {
+            success = false,
+            error_code = "SESSION_TAKEN_OVER",
+            error = string.format("This client's Cheat Engine session was taken over by %s at %s. "
+                .. "Call take_over_session to reclaim it (only with the user's approval).",
+                evicted.by_name, os.date("%Y-%m-%d %H:%M:%S", evicted.at)),
+            owner = sessionManager.describe(s.owner, now),
+        }
+    end
+    return {
+        success = false,
+        error_code = "SESSION_IN_USE",
+        error = string.format("Cheat Engine bridge is in use by %s (%s). Call get_session_status for details, "
+            .. "or take_over_session(force=true) once the user approves disconnecting it.",
+            s.owner.name, s.owner.client_id),
+        owner = sessionManager.describe(s.owner, now),
+    }
+end
+
+function sessionManager.onDisconnect(connId)
+    local s = serverState.session
+    if s.owner and s.owner.conn_id == connId then
+        log(string.format("Session owner %s disconnected; session released", s.owner.client_id))
+        s.owner = nil
+    end
+end
+
+function cmd_get_session_status(params, caller)
+    local s = serverState.session
+    local now = os.time()
+    sessionManager.expireIdleOwner(now)
+    local contenders = {}
+    for _, c in pairs(s.contenders) do
+        if now - c.last_seen <= sessionManager.CONTENDER_TTL_SECONDS and c.client_id ~= caller.client_id then
+            table.insert(contenders, {
+                client_id = c.client_id, name = c.name, host = c.host, pid = c.pid,
+                attempts = c.attempts, last_method = c.last_method,
+                seconds_since_last_attempt = now - c.last_seen,
+            })
+        end
+    end
+    table.sort(contenders, function(a, b) return a.seconds_since_last_attempt < b.seconds_since_last_attempt end)
+    return {
+        success = true,
+        you = caller.client_id,
+        you_are_owner = s.owner ~= nil and s.owner.client_id == caller.client_id,
+        owner = sessionManager.describe(s.owner, now),
+        open_connections = serverState.connections,
+        idle_timeout_seconds = sessionManager.IDLE_TIMEOUT_SECONDS,
+        contenders = contenders,
+    }
+end
+
+function cmd_take_over_session(params, caller)
+    local s = serverState.session
+    local now = os.time()
+    sessionManager.expireIdleOwner(now)
+    local previous = s.owner
+
+    if previous and previous.client_id ~= caller.client_id then
+        if not params.force then
+            return {
+                success = false,
+                error_code = "SESSION_IN_USE",
+                error = "Session is owned by another client. Pass force=true (only with the user's approval) to take it over.",
+                owner = sessionManager.describe(previous, now),
+            }
+        end
+        s.evicted[previous.client_id] = { by_name = caller.name, by_id = caller.client_id, at = now }
+        log(string.format("Session taken over from %s by %s", previous.client_id, caller.client_id))
+    end
+
+    if not previous or previous.client_id ~= caller.client_id then
+        sessionManager.claim(caller, now)
+    else
+        previous.last_activity = now
+    end
+
+    local cleaned = false
+    if params.cleanup then
+        cleanupZombieState()
+        cleaned = true
+    end
+    return {
+        success = true,
+        owner = sessionManager.describe(s.owner, now),
+        previous_owner = (previous and previous.client_id ~= caller.client_id) and sessionManager.describe(previous, now) or nil,
+        cleaned_up = cleaned,
+    }
+end
+
+function cmd_release_session(params, caller)
+    local s = serverState.session
+    if s.owner and s.owner.client_id == caller.client_id then
+        log(string.format("Session released by %s", caller.client_id))
+        s.owner = nil
+        return { success = true, released = true }
+    end
+    return { success = true, released = false, reason = "caller does not own the session" }
+end
+
+-- >>> END UNIT-25 <<<
+
 -- ============================================================================
 -- COMMAND DISPATCHER
 -- ============================================================================
@@ -5942,28 +6163,39 @@ local commandHandlers = {
     full_access            = cmd_full_access,
     allocate_kernel_memory = cmd_allocate_kernel_memory,
     -- >>> END UNIT-08 <<<
+    -- >>> BEGIN UNIT-25 dispatcher entries <<<
+    get_session_status = cmd_get_session_status,
+    take_over_session  = cmd_take_over_session,
+    release_session    = cmd_release_session,
+    -- >>> END UNIT-25 <<<
 }
 
 -- ============================================================================
 -- MAIN COMMAND PROCESSOR
 -- ============================================================================
 
-local function executeCommand(jsonRequest)
+local function executeCommand(jsonRequest, connId)
     local ok, request = pcall(json.decode, jsonRequest)
     if not ok or not request then
         return json.encode({ jsonrpc = "2.0", error = { code = -32700, message = "Parse error" }, id = nil })
     end
-    
+
     local method = request.method
     local params = request.params or {}
     local id = request.id
-    
+
     local handler = commandHandlers[method]
     if not handler then
         return json.encode({ jsonrpc = "2.0", error = { code = -32601, message = "Method not found: " .. tostring(method) }, id = id })
     end
-    
-    local ok2, result = pcall(handler, params)
+
+    local caller = sessionManager.identify(request, connId)
+    local denied = sessionManager.authorize(method, caller)
+    if denied then
+        return json.encode({ jsonrpc = "2.0", result = denied, id = id })
+    end
+
+    local ok2, result = pcall(handler, params, caller)
     if not ok2 then
         return json.encode({ jsonrpc = "2.0", error = { code = -32603, message = "Internal error: " .. tostring(result) }, id = id })
     end
@@ -5977,20 +6209,29 @@ end
 -- Replaces v10 Timer architecture to prevent GUI Freezes.
 -- I/O happens in Worker Thread. Execution happens in Main Thread.
 
-local function PipeWorker(thread)
-    log("Worker Thread Started - Waiting for connection...")
-    
+local function PipeWorker(thread, worker)
+    -- One worker per pipe instance; several run concurrently so extra clients
+    -- can connect and be told the session is in use (see UNIT-25).
+    if worker.slot == 1 then log("Worker Thread Started - Waiting for connection...") end
+    local connCount = 0
+
     while not thread.Terminated do
         -- Create Pipe Instance per connection attempt
         -- Increased buffer size to 256KB for better throughput
-        local pipe = createPipe(PIPE_NAME, 262144, 262144)  -- 256 KB buffers (was 64 KB)
-        if not pipe then
-            log("Fatal: Failed to create pipe")
+        local pipe = createPipe(PIPE_NAME, 262144, 262144, sessionManager.MAX_PIPE_INSTANCES)  -- 256 KB buffers (was 64 KB)
+        if not pipe or pipe.valid == false then
+            if worker.slot == 1 then
+                log("Fatal: Failed to create pipe")
+            else
+                -- Older CE builds may not honour maxInstanceCount; fall back to one client
+                log(string.format("Pipe instance %d unavailable; extra clients will see a busy pipe", worker.slot))
+            end
+            if pipe then pcall(function() pipe.destroy() end) end
             return
         end
-        
+
         -- Store reference so we can destroy it from main thread (stopServer) to break blocking calls
-        serverState.workerPipe = pipe
+        worker.pipe = pipe
         
         -- timeout for blocking operations (connect/read)
         -- We DO NOT set pipe.Timeout because it auto-disconnects on timeout.
@@ -6007,9 +6248,14 @@ local function PipeWorker(thread)
         end)
         
         if pipe.Connected and not thread.Terminated then
-            log("Client Connected")
-            serverState.connected = true
-            
+            connCount = connCount + 1
+            local connId = worker.generation .. ":" .. worker.slot .. "." .. connCount
+            log("Client Connected (connection " .. connId .. ")")
+            thread.synchronize(function()
+                serverState.connections = serverState.connections + 1
+                serverState.connected = true
+            end)
+
             while not thread.Terminated and pipe.Connected do
                 -- Try to read header (4 bytes)
                 -- We use pcall to handle timeouts/errors gracefully
@@ -6027,7 +6273,7 @@ local function PipeWorker(thread)
                             -- We pause the worker and run logic on GUI thread to be safe
                             local response = nil
                             thread.synchronize(function()
-                                response = executeCommand(payload)
+                                response = executeCommand(payload, connId)
                             end)
                             
                             -- Write response back (Worker Thread)
@@ -6053,8 +6299,12 @@ local function PipeWorker(thread)
                 end
             end
             
-            serverState.connected = false
-            log("Client Disconnected")
+            thread.synchronize(function()
+                serverState.connections = math.max(0, serverState.connections - 1)
+                serverState.connected = serverState.connections > 0
+                sessionManager.onDisconnect(connId)
+            end)
+            log("Client Disconnected (connection " .. connId .. ")")
         else
             -- Debug: acceptConnection returned but pipe not valid
             -- This usually happens on termination or weird state
@@ -6064,7 +6314,7 @@ local function PipeWorker(thread)
         end
         
         -- Clean up pipe
-        serverState.workerPipe = nil
+        worker.pipe = nil
         pcall(function() pipe.destroy() end)
         
         -- Brief sleep before recreating pipe to accept new connection
@@ -6079,19 +6329,23 @@ end
 -- ============================================================================
 
 function StopMCPBridge()
-    if serverState.workerThread then
-        log("Stopping Server (Terminating Thread)...")
-        serverState.workerThread.terminate()
-        
-        -- Force destroy the pipe if it's currently blocking on acceptConnection or read
-        if serverState.workerPipe then
-            pcall(function() serverState.workerPipe.destroy() end)
-            serverState.workerPipe = nil
+    if #serverState.workers > 0 then
+        log("Stopping Server (Terminating Threads)...")
+        for _, worker in ipairs(serverState.workers) do
+            if worker.thread then worker.thread.terminate() end
+
+            -- Force destroy the pipe if it's currently blocking on acceptConnection or read
+            if worker.pipe then
+                pcall(function() worker.pipe.destroy() end)
+                worker.pipe = nil
+            end
         end
-        
-        serverState.workerThread = nil
+
+        serverState.workers = {}
         serverState.running = false
     end
+    serverState.session.owner = nil
+    serverState.connections = 0
     
     if serverState.timer then
         serverState.timer.destroy()
@@ -6112,12 +6366,17 @@ function StartMCPBridge()
     
     serverState.running = true
     serverState.connected = false
+    serverState.generation = serverState.generation + 1
     
-    -- Create the Worker Thread
-    serverState.workerThread = createThread(PipeWorker)
-    
+    -- Create the Worker Threads (one per pipe instance)
+    for slot = 1, sessionManager.MAX_PIPE_INSTANCES do
+        local worker = { slot = slot, generation = serverState.generation }
+        worker.thread = createThread(function(thread) PipeWorker(thread, worker) end)
+        table.insert(serverState.workers, worker)
+    end
+
     log("===========================================")
-    log("MCP Server Listening on: " .. PIPE_NAME)
+    log("MCP Server Listening on: " .. PIPE_NAME .. " (" .. sessionManager.MAX_PIPE_INSTANCES .. " pipe instances)")
     log("Architecture: Threaded I/O + Synchronized Execution")
     log("Cleanup: Zombie Prevention Active")
     log("===========================================")

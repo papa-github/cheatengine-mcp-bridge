@@ -72,6 +72,50 @@
 
 ---
 
+### Session ownership (Unit 25)
+
+One client owns the bridge at a time. The Lua bridge serves 4 pipe instances, so extra clients can connect, but their commands return `{success: false, error_code: "SESSION_IN_USE", owner: {...}}`. The first real command from any client claims a free session. `ping`, `get_session_status`, `take_over_session` and `release_session` work for every client.
+
+Ownership belongs to a `client_id` that `mcp_cheatengine.py` sends with every request (top-level `session: {client_id, name, host, pid}`), so it survives pipe reconnects. Legacy clients without that field are identified by their pipe connection.
+
+The session is released automatically when the owner's pipe connection closes, or when the owner has been idle for **1 hour** (the next contender then claims it without `force`). A client whose session was force-taken gets `SESSION_TAKEN_OVER` until it reclaims the session.
+
+`CE_MCP_CLIENT_NAME` overrides the name shown to other clients (default: the MCP client's own name, e.g. `claude-code 2.x`).
+
+### `get_session_status`
+
+**Purpose:** Show the current owner and any rejected clients ("contenders") from the last 10 minutes.
+
+**Parameters:** None
+
+**Example response:**
+```json
+{"success": true, "you": "LAPTOP:1200:3f2a9c1e:s1", "you_are_owner": true,
+ "owner": {"client_id": "LAPTOP:1200:3f2a9c1e:s1", "name": "claude-code 2.1.0", "host": "LAPTOP", "pid": 1200,
+           "since": "2026-10-31 19:30:02", "last_activity": "2026-10-31 19:41:15", "idle_seconds": 4},
+ "open_connections": 2, "idle_timeout_seconds": 3600,
+ "contenders": [{"client_id": "LAPTOP:884:91bd02aa:s1", "name": "agent-b", "host": "LAPTOP", "pid": 884,
+                 "attempts": 3, "last_method": "read_memory", "seconds_since_last_attempt": 12}]}
+```
+
+### `take_over_session`
+
+**Purpose:** Claim the session. With `force: true`, disconnect the current owner. **Agents must get the user's approval before passing `force: true`.**
+
+**Parameters:**
+- `force` (bool, default false): take the session even if another client owns it.
+- `cleanup` (bool, default false): also run the zombie cleanup (remove breakpoints, DBVM watches, scans) left by the previous owner.
+
+**Returns:** `success`, `owner`, `previous_owner` (when someone was evicted), `cleaned_up`. Without `force`, a session owned by someone else returns `SESSION_IN_USE`.
+
+### `release_session`
+
+**Purpose:** Give up ownership so another client can use the bridge.
+
+**Returns:** `success`, `released` (false if the caller was not the owner).
+
+---
+
 ## 2. Process & Modules
 
 ### `get_process_info`
@@ -3204,6 +3248,7 @@ The MCP bridge Python server (`mcp_cheatengine.py`) reads the following environm
 |----------|------|---------|-------------|
 | `CE_MCP_TIMEOUT` | float (seconds) | 30 | Timeout in seconds for each bridge command round-trip. Set `<=0` to disable timeout enforcement. |
 | `CE_MCP_ALLOW_SHELL` | int (0 or 1) | 0 | Set to `1` to enable shell execution tools (`run_command`, `shell_execute`). **Disabled by default for security.** |
+| `CE_MCP_CLIENT_NAME` | string | MCP client name | Name shown to other clients in `SESSION_IN_USE` errors and `get_session_status`. |
 
 **Setting environment variables:**
 
@@ -3262,7 +3307,9 @@ All commands return `success: false` with an `error` field on failure:
 | `"No free hardware breakpoint slots"` | All 4 debug registers (DR0-DR3) are in use. | Call `clear_all_breakpoints` to free slots. |
 | `"DBK driver not loaded"` | DBK/DBVM kernel driver not initialized. | Load DBK driver in CE settings. |
 | `"DBVM watch returned nil"` | DBVM not activated in CE settings. | Enable DBVM in Edit → Settings → Debugger. |
-| `"Cheat Engine Bridge not running"` | Named pipe not found. | Start CE with `ce_mcp_bridge.lua` loaded. |
+| `"pipe not found"` | Named pipe not found. | Start CE with `ce_mcp_bridge.lua` loaded. |
+| `error_code: "SESSION_IN_USE"` | Another client owns the bridge session (or, with an older bridge, holds the only pipe). | `get_session_status`, then ask the user before `take_over_session(force=true)`. |
+| `error_code: "SESSION_TAKEN_OVER"` | Another client force-took this client's session. | Stop and tell the user; reclaim only with their approval. |
 | `"Response too large"` | Pipe response exceeded 16 MB limit. | Reduce `size` or `max` parameter. |
 | `"Pipe Communication failed"` | Named pipe connection lost. | Bridge auto-reconnects on next call. |
 | `"Invalid JSON received from CE"` | Corrupt pipe response. | Usually transient; retry the command. |
