@@ -3249,6 +3249,9 @@ The MCP bridge Python server (`mcp_cheatengine.py`) reads the following environm
 | `CE_MCP_TIMEOUT` | float (seconds) | 30 | Timeout in seconds for each bridge command round-trip. Set `<=0` to disable timeout enforcement. |
 | `CE_MCP_ALLOW_SHELL` | int (0 or 1) | 0 | Set to `1` to enable shell execution tools (`run_command`, `shell_execute`). **Disabled by default for security.** |
 | `CE_MCP_CLIENT_NAME` | string | MCP client name | Name shown to other clients in `SESSION_IN_USE` errors and `get_session_status`. |
+| `CE_MCP_SERVE` | `stdio` or `http` | `stdio` | `http` serves MCP over streamable HTTP at `/mcp` (same as `--http`). |
+| `CE_MCP_HTTP_HOST` | string | `127.0.0.1` | HTTP bind host (same as `--host`). Non-loopback binds have no authentication. |
+| `CE_MCP_HTTP_PORT` | int | 8765 | HTTP port (same as `--port`). |
 
 **Setting environment variables:**
 

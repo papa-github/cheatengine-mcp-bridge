@@ -226,6 +226,13 @@ CE_MCP_HOST = os.environ.get("CE_MCP_HOST", DEFAULT_TCP_HOST).strip() or DEFAULT
 CE_MCP_PORT = _parse_tcp_port(os.environ.get("CE_MCP_PORT"))
 CE_MCP_CLIENT_NAME = os.environ.get("CE_MCP_CLIENT_NAME", "").strip()
 
+# How this MCP server is exposed to AI clients (not how it reaches CE)
+CE_MCP_SERVE = (os.environ.get("CE_MCP_SERVE") or "stdio").strip().lower()
+if CE_MCP_SERVE not in {"stdio", "http"}:
+    raise ValueError("CE_MCP_SERVE must be 'stdio' or 'http'.")
+CE_MCP_HTTP_HOST = os.environ.get("CE_MCP_HTTP_HOST", "127.0.0.1").strip() or "127.0.0.1"
+CE_MCP_HTTP_PORT = _parse_tcp_port(os.environ.get("CE_MCP_HTTP_PORT") or "8765")
+
 # ============================================================================
 # SESSION IDENTITY
 # The Lua bridge lets one client own the session at a time (SESSION_IN_USE for
@@ -236,6 +243,12 @@ CE_MCP_CLIENT_NAME = os.environ.get("CE_MCP_CLIENT_NAME", "").strip()
 _PROCESS_CLIENT_ID = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
 _mcp_session_ids = weakref.WeakKeyDictionary()  # ServerSession -> per-process index
 _mcp_session_lock = threading.Lock()
+_mcp_session_counter = 0
+# client_ids of MCP sessions that have ended. In HTTP mode they share one pipe
+# connection, so the Lua side can't see them leave; release_session is sent for
+# each before the next command. (Not sent from the GC callback itself, which
+# could fire while send_command already holds the client lock.)
+_ended_session_ids = []
 
 
 def _current_mcp_session():
@@ -252,11 +265,14 @@ def _session_identity():
     client_id = _PROCESS_CLIENT_ID
     name = CE_MCP_CLIENT_NAME
     if session is not None:
+        global _mcp_session_counter
         with _mcp_session_lock:
             index = _mcp_session_ids.get(session)
             if index is None:
-                index = len(_mcp_session_ids) + 1
+                _mcp_session_counter += 1
+                index = _mcp_session_counter
                 _mcp_session_ids[session] = index
+                weakref.finalize(session, _ended_session_ids.append, f"{_PROCESS_CLIENT_ID}:s{index}")
         client_id = f"{_PROCESS_CLIENT_ID}:s{index}"
         if not name:
             try:
@@ -280,6 +296,9 @@ class CEBridgeClient:
         self.timeout_seconds = CE_MCP_TIMEOUT_SECONDS
         # Human-readable reason for the most recent failed connect(), if any
         self.last_connect_error = None
+        # One request/response in flight at a time; in HTTP mode several MCP
+        # sessions share this client and would otherwise interleave frames.
+        self._lock = threading.Lock()
 
     @property
     def connected(self):
@@ -338,6 +357,26 @@ class CEBridgeClient:
 
     def send_command(self, method, params=None):
         """Send command to CE Bridge with auto-reconnection on failure."""
+        session = _session_identity()
+        with self._lock:
+            self._release_ended_sessions_locked()
+            return self._send_command_locked(method, params, session)
+
+    def release_ended_sessions(self):
+        """Tell the bridge about MCP sessions that have gone away (HTTP mode)."""
+        if _ended_session_ids:
+            with self._lock:
+                self._release_ended_sessions_locked()
+
+    def _release_ended_sessions_locked(self):
+        while _ended_session_ids:
+            ended_id = _ended_session_ids.pop()
+            try:
+                self._send_command_locked("release_session", None, {"client_id": ended_id, "name": "ended"})
+            except Exception as exc:
+                debug_log(f"Could not release ended session {ended_id}: {exc}")
+
+    def _send_command_locked(self, method, params, session):
         max_retries = 2
         last_error = None
         
@@ -352,7 +391,7 @@ class CEBridgeClient:
                 "method": method,
                 "params": params or {},
                 "id": int(time.time() * 1000),
-                "session": _session_identity(),
+                "session": session,
             }
             
             try:
@@ -2488,10 +2527,53 @@ def get_opened_process_handle() -> str:
 
 # >>> END UNIT-07 <<<
 
+def _parse_server_args():
+    import argparse
+    parser = argparse.ArgumentParser(description="Cheat Engine MCP server.")
+    parser.add_argument(
+        "--http", action="store_true", default=CE_MCP_SERVE == "http",
+        help="Serve MCP over streamable HTTP instead of stdio (or set CE_MCP_SERVE=http).",
+    )
+    parser.add_argument("--host", default=CE_MCP_HTTP_HOST, help=f"HTTP bind host (default: {CE_MCP_HTTP_HOST})")
+    parser.add_argument("--port", type=int, default=CE_MCP_HTTP_PORT, help=f"HTTP port (default: {CE_MCP_HTTP_PORT})")
+    return parser.parse_args()
+
+
+def _run_http(host, port):
+    mcp.settings.host = host
+    mcp.settings.port = port
+    if host not in {"127.0.0.1", "localhost", "::1"}:
+        # FastMCP only allows loopback Host headers by default; a deliberate
+        # non-loopback bind needs that check off to be reachable at all.
+        mcp.settings.transport_security = None
+        debug_log(
+            "WARNING: non-loopback HTTP bind exposes full Cheat Engine control "
+            "(memory writes, code injection) to the network with no authentication. "
+            "Prefer 127.0.0.1 plus an SSH tunnel."
+        )
+    def _release_loop():
+        # Ended HTTP sessions are otherwise only released on the next command,
+        # which may never come through this server.
+        while True:
+            time.sleep(5)
+            try:
+                ce_client.release_ended_sessions()
+            except Exception as exc:
+                debug_log(f"Session release loop error: {exc}")
+
+    threading.Thread(target=_release_loop, name="ce-session-release", daemon=True).start()
+    debug_log(f"Serving MCP over HTTP at http://{host}:{port}{mcp.settings.streamable_http_path}")
+    mcp.run(transport="streamable-http")
+
+
 if __name__ == "__main__":
     try:
+        args = _parse_server_args()
         debug_log("Starting FastMCP server (v12/v99 compatible)...")
-        mcp.run()
+        if args.http:
+            _run_http(args.host, args.port)
+        else:
+            mcp.run()
     except Exception as e:
         debug_log(f"Fatal Crash: {e}")
         traceback.print_exc(file=sys.stderr)

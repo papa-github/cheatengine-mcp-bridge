@@ -179,6 +179,29 @@ For MCP client configs that support environment variables:
 
 Set `--host` on the relay and `CE_MCP_HOST` on the MCP server to addresses that match your network setup. Keep the relay bound to trusted interfaces only, because anyone who can reach it can control the Cheat Engine bridge.
 
+#### HTTP mode (drive Cheat Engine from another machine)
+
+Instead of running the MCP server next to the AI client, run it on the Cheat Engine machine and expose MCP over streamable HTTP. The remote AI client connects to it directly, with no Python or pywin32 needed on its side.
+
+1. On the Cheat Engine machine, load the bridge in CE as usual, then start the server (keep the console open, or run it from Task Scheduler at logon as the **same user** as Cheat Engine):
+
+```powershell
+python C:\path\to\cheatengine-mcp-bridge\MCP_Server\mcp_cheatengine.py --http
+```
+
+It listens on `http://127.0.0.1:8765/mcp` (`--host` / `--port`, or `CE_MCP_SERVE=http`, `CE_MCP_HTTP_HOST`, `CE_MCP_HTTP_PORT`).
+
+2. On the other machine, forward the port over SSH and register the server:
+
+```bash
+ssh -N -L 8765:127.0.0.1:8765 user@ce-machine
+claude mcp add --transport http cheatengine http://127.0.0.1:8765/mcp
+```
+
+Keep the bind on `127.0.0.1` and let SSH provide encryption and authentication. HTTP mode has **no authentication of its own**; binding to a LAN address prints a warning and exposes full memory-write and code-injection access to anyone on that network.
+
+Each MCP session is a separate client for [session ownership](#session_in_use--another-agent-holds-the-bridge): one session owns the bridge, and ended sessions release it within a few seconds.
+
 ### 3. Verify Connection
 Use the `ping` tool to verify connectivity:
 ```json
@@ -316,6 +339,8 @@ Only one MCP client owns the bridge at a time; others get `SESSION_IN_USE` namin
 | `CE_MCP_TIMEOUT` | `30` | Timeout (seconds) for each MCP tool call. |
 | `CE_MCP_ALLOW_SHELL` | *unset* | Set to `1` to enable `run_command` / `shell_execute` tools. **Arbitrary code execution risk** — leave unset by default. |
 | `CE_MCP_CLIENT_NAME` | MCP client name | Name other clients see in `SESSION_IN_USE` / `get_session_status`. |
+| `CE_MCP_SERVE` | `stdio` | `http` serves MCP over streamable HTTP (same as `--http`). |
+| `CE_MCP_HTTP_HOST` / `CE_MCP_HTTP_PORT` | `127.0.0.1` / `8765` | HTTP bind address (same as `--host` / `--port`). |
 
 ---
 

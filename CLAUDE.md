@@ -73,6 +73,7 @@ Two files are the source of truth — there's no codegen, so you must edit both:
 - **Codex config:** use TOML, not JSON. Add `[mcp_servers.cheatengine]`, `command = "python"`, and `args = ['C:\path\to\MCP_Server\mcp_cheatengine.py']`. Use TOML single-quoted strings for Windows paths so backslashes are literal, then restart Codex and verify with the `ping` tool.
 - **Anti-cheat safety** (per `AI_Context/AI_Guide_MCP_Server_Implementation.md`): prefer hardware DR0–DR3 breakpoints over software (`0xCC`) breakpoints, and prefer DBVM watches for truly invisible tracing. The existing `cmd_set_breakpoint` already uses `debug_setBreakpoint` (hardware); keep new debugging tools on that path.
 - **Env vars:** `CE_MCP_TIMEOUT` (default 30s) limits per-tool latency; `CE_MCP_ALLOW_SHELL=1` enables `run_command` / `shell_execute` (default: disabled).
+- **HTTP mode:** `mcp_cheatengine.py --http` (or `CE_MCP_SERVE=http`) serves streamable HTTP on `127.0.0.1:8765/mcp` for remote clients over an SSH tunnel. All MCP sessions share one `ce_client`; `send_command` holds a lock so pipe frames never interleave, and each session gets its own `client_id` for ownership.
 
 ## Conventions (v12 overhaul)
 
