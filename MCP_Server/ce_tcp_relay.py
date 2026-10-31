@@ -15,6 +15,7 @@ to another machine.
 from __future__ import annotations
 
 import argparse
+import json
 import socket
 import socketserver
 import struct
@@ -33,6 +34,10 @@ PIPE_NAME = r"\\.\pipe\CE_MCP_Bridge_v99"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 9876
 MAX_FRAME_SIZE_BYTES = 32 * 1024 * 1024
+
+# Windows error codes returned by CreateFile on a named pipe
+ERROR_FILE_NOT_FOUND = 2
+ERROR_PIPE_BUSY = 231
 
 
 def read_socket_exact(sock: socket.socket, size: int) -> Optional[bytes]:
@@ -83,6 +88,37 @@ def open_pipe():
     )
 
 
+def describe_pipe_open_error(exc: pywintypes.error) -> tuple[str, str]:
+    """Return (error_code, message) for a failed pipe open."""
+    if exc.winerror == ERROR_PIPE_BUSY:
+        return (
+            "SESSION_IN_USE",
+            "The Cheat Engine bridge is already serving another client. Close the "
+            "other MCP session (or its stale process) and retry.",
+        )
+    if exc.winerror == ERROR_FILE_NOT_FOUND:
+        return (
+            "CE_API_UNAVAILABLE",
+            "Cheat Engine bridge pipe not found. Is Cheat Engine running with "
+            "ce_mcp_bridge.lua executed?",
+        )
+    return "INTERNAL_ERROR", f"Relay could not open the Cheat Engine pipe: {exc}"
+
+
+def error_frame(req_body: bytes, error_code: str, message: str) -> bytes:
+    """Build a framed JSON-RPC response carrying a bridge-style error result."""
+    try:
+        req_id = json.loads(req_body.decode("utf-8")).get("id")
+    except (ValueError, AttributeError):
+        req_id = None
+    body = json.dumps({
+        "jsonrpc": "2.0",
+        "result": {"success": False, "error": message, "error_code": error_code},
+        "id": req_id,
+    }).encode("utf-8")
+    return struct.pack("<I", len(body)) + body
+
+
 class RelayHandler(socketserver.BaseRequestHandler):
     """Relay one TCP client connection to one persistent CE pipe connection."""
 
@@ -96,7 +132,6 @@ class RelayHandler(socketserver.BaseRequestHandler):
         peer = f"{self.client_address[0]}:{self.client_address[1]}"
         print(f"[relay] TCP client connected: {peer}", file=sys.stderr, flush=True)
         try:
-            self.pipe_handle = open_pipe()
             while True:
                 req_header = read_socket_exact(self.request, 4)
                 if req_header is None:
@@ -106,6 +141,17 @@ class RelayHandler(socketserver.BaseRequestHandler):
                 req_body = read_socket_exact(self.request, req_len)
                 if req_body is None:
                     raise ConnectionError("TCP client disconnected before request body.")
+
+                # Open the pipe lazily so a busy/missing bridge is reported to the
+                # client as an error response instead of a silent hang.
+                if self.pipe_handle is None:
+                    try:
+                        self.pipe_handle = open_pipe()
+                    except pywintypes.error as exc:
+                        error_code, message = describe_pipe_open_error(exc)
+                        print(f"[relay] {peer}: {error_code}: {message}", file=sys.stderr, flush=True)
+                        self.request.sendall(error_frame(req_body, error_code, message))
+                        continue
 
                 win32file.WriteFile(self.pipe_handle, req_header)
                 win32file.WriteFile(self.pipe_handle, req_body)
@@ -134,8 +180,11 @@ class RelayHandler(socketserver.BaseRequestHandler):
             self.pipe_handle = None
 
 
-class RelayServer(socketserver.TCPServer):
+class RelayServer(socketserver.ThreadingTCPServer):
+    # Threaded so a second client gets an immediate SESSION_IN_USE response
+    # instead of queueing behind the first connection.
     allow_reuse_address = True
+    daemon_threads = True
 
 
 def parse_args() -> argparse.Namespace:

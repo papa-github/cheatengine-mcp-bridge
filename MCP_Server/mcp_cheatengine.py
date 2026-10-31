@@ -109,9 +109,11 @@ except ImportError as e:
 
 try:
     import win32file
+    import win32pipe
     import pywintypes
 except ImportError:
     win32file = None
+    win32pipe = None
     pywintypes = None
 
 # Restore stdout for MCP usage after imports are complete
@@ -141,6 +143,34 @@ MCP_SERVER_NAME = "cheatengine"
 MAX_RESPONSE_SIZE_BYTES = 32 * 1024 * 1024
 DEFAULT_TCP_HOST = "127.0.0.1"
 DEFAULT_TCP_PORT = 9876
+
+# Windows error codes returned by CreateFile on a named pipe
+ERROR_FILE_NOT_FOUND = 2
+ERROR_ACCESS_DENIED = 5
+ERROR_SEM_TIMEOUT = 121  # WaitNamedPipe timed out
+ERROR_PIPE_BUSY = 231
+PIPE_BUSY_WAIT_MS = 2000
+
+
+def _describe_pipe_open_error(exc):
+    """Translate a CreateFile/WaitNamedPipe failure into an actionable message."""
+    code = getattr(exc, "winerror", None)
+    if code == ERROR_FILE_NOT_FOUND:
+        return (
+            "pipe not found. Cheat Engine is not running, or ce_mcp_bridge.lua "
+            "has not been executed in it."
+        )
+    if code in (ERROR_PIPE_BUSY, ERROR_SEM_TIMEOUT):
+        return (
+            "SESSION_IN_USE: the bridge is already serving another client. Close "
+            "the other MCP session (or its stale mcp_cheatengine.py process) and retry."
+        )
+    if code == ERROR_ACCESS_DENIED:
+        return (
+            "access denied opening the pipe. Run the MCP server as the same "
+            "Windows user (and elevation level) as Cheat Engine."
+        )
+    return f"pipe open failed: {exc}"
 
 
 def _parse_timeout_seconds(raw_value):
@@ -200,6 +230,8 @@ CE_MCP_PORT = _parse_tcp_port(os.environ.get("CE_MCP_PORT"))
 class CEBridgeClient:
     def __init__(self):
         self.timeout_seconds = CE_MCP_TIMEOUT_SECONDS
+        # Human-readable reason for the most recent failed connect(), if any
+        self.last_connect_error = None
 
     @property
     def connected(self):
@@ -264,7 +296,8 @@ class CEBridgeClient:
         for attempt in range(max_retries):
             if not self.connected:
                 if not self.connect():
-                    raise ConnectionError(f"{self._endpoint_description()} is not reachable.")
+                    reason = self.last_connect_error or "is not reachable."
+                    raise ConnectionError(f"{self._endpoint_description()}: {reason}")
 
             request = {
                 "jsonrpc": "2.0",
@@ -313,20 +346,35 @@ class CENamedPipeBridgeClient(CEBridgeClient):
     def connected(self):
         return self.handle is not None
 
+    def _open_pipe(self):
+        return win32file.CreateFile(
+            PIPE_NAME,
+            win32file.GENERIC_READ | win32file.GENERIC_WRITE,
+            0,
+            None,
+            win32file.OPEN_EXISTING,
+            0,
+            None
+        )
+
     def connect(self):
         """Attempts to connect to the CE Named Pipe."""
+        self.last_connect_error = None
         try:
-            self.handle = win32file.CreateFile(
-                PIPE_NAME,
-                win32file.GENERIC_READ | win32file.GENERIC_WRITE,
-                0,
-                None,
-                win32file.OPEN_EXISTING,
-                0,
-                None
-            )
+            self.handle = self._open_pipe()
             return True
-        except pywintypes.error:
+        except pywintypes.error as exc:
+            if exc.winerror != ERROR_PIPE_BUSY:
+                self.last_connect_error = _describe_pipe_open_error(exc)
+                return False
+
+        # Every pipe instance is held by another client. Give it a moment to free up.
+        try:
+            win32pipe.WaitNamedPipe(PIPE_NAME, PIPE_BUSY_WAIT_MS)
+            self.handle = self._open_pipe()
+            return True
+        except pywintypes.error as exc:
+            self.last_connect_error = _describe_pipe_open_error(exc)
             return False
 
     def _endpoint_description(self):
@@ -389,12 +437,17 @@ class CETcpBridgeClient(CEBridgeClient):
 
     def connect(self):
         """Attempts to connect to the TCP relay."""
+        self.last_connect_error = None
         try:
             connect_timeout = self.timeout_seconds if self.timeout_seconds is not None else None
             self.sock = socket.create_connection((self.host, self.port), timeout=connect_timeout)
             self.sock.settimeout(connect_timeout)
             return True
-        except OSError:
+        except OSError as exc:
+            self.last_connect_error = (
+                f"cannot connect ({exc}). Is ce_tcp_relay.py running on the "
+                "Cheat Engine machine?"
+            )
             self.close()
             return False
 
